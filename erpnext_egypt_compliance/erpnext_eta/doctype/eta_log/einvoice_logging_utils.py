@@ -2,6 +2,7 @@ import frappe
 from typing import Union, Dict, List
 from erpnext_egypt_compliance.erpnext_eta.utils import get_company_eta_connector
 from erpnext_egypt_compliance.erpnext_eta.utils import create_eta_log
+from erpnext_egypt_compliance.erpnext_eta.utils import validate_live_submission_readiness
 from erpnext_egypt_compliance.erpnext_eta.einvoice_submitter import EInvoiceSubmitter
 
 
@@ -27,6 +28,11 @@ def _submit_einvoice(einvoices: Union[Dict, List[Dict]], connector ,submitted_by
 		# Always ensure einvoices is a list
 		if isinstance(einvoices, dict):
 			einvoices = [einvoices]
+
+		# Central gate: this is the only choke point every e-invoice path
+		# (manual button, Live on-signature, hourly Batch) passes through.
+		# ETA master data is enforced here — never on Company creation.
+		validate_live_submission_readiness(connector.company, connector=connector)
 
 		# Fetch ETA connector for the company
 		# connector = get_company_eta_connector(company)

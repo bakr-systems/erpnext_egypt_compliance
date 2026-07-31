@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import pytz
 
 import frappe
+from frappe import _
 import requests
 import json
 
@@ -79,6 +80,59 @@ def get_company_eta_connector(company, throw_if_no_connector=True):
 		return connector
 	elif throw_if_no_connector:
 		frappe.throw("No Default Connecter Set.")
+
+
+def validate_live_submission_readiness(company, connector=None):
+	"""Single gate every LIVE ETA HTTP submission must pass through.
+
+	The ETA master data (Default Activity Code, connector, client
+	credentials) is enforced HERE — at submission time — instead of via
+	`reqd` on Company custom fields, so that creating a Company, finishing
+	the Setup Wizard, and submitting internal Sales Invoices all work
+	without any ETA setup. Only an actual submission attempt to ETA
+	requires the data, and failures come back as one clear message.
+
+	Args:
+		company (str): Company name the submission is issued for.
+		connector: Optional ETA Connector / ETA POS Connector document.
+			When omitted, the company's default ETA Connector is looked up.
+
+	Returns:
+		The connector document when the company is submission-ready.
+
+	Raises:
+		frappe.ValidationError: listing every missing prerequisite.
+	"""
+	missing = []
+
+	if not frappe.db.get_value("Company", company, "eta_default_activity_code"):
+		missing.append(
+			_("ETA Default Activity Code is not set on Company {0} (ETA Details section).").format(company)
+		)
+
+	if connector is None:
+		connector = get_company_eta_connector(company, throw_if_no_connector=False)
+	if connector is None:
+		missing.append(
+			_(
+				"No default ETA Connector is configured for Company {0}. "
+				"Create an ETA Connector with the ETA Client Credentials and mark it as default."
+			).format(company)
+		)
+	else:
+		if not connector.get("client_id"):
+			missing.append(_("Client ID is missing on ETA Connector {0}.").format(connector.name))
+		if not connector.get_password("client_secret", raise_exception=False):
+			missing.append(_("Client Secret is missing on ETA Connector {0}.").format(connector.name))
+
+	if missing:
+		frappe.throw(
+			"<br>".join(missing),
+			title=_("Cannot Submit to ETA — Setup Incomplete"),
+			exc=frappe.ValidationError,
+		)
+
+	return connector
 
 
 def autofetch_eta_status(company):
