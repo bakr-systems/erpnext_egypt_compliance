@@ -2,6 +2,7 @@ import frappe
 from erpnext_egypt_compliance.erpnext_eta.doctype.eta_pos_connector.eta_pos_connector import ETASession
 import json
 from erpnext_egypt_compliance.erpnext_eta.utils import create_eta_log
+from erpnext_egypt_compliance.erpnext_eta.utils import validate_live_submission_readiness
 import requests
 
 class EReceiptSubmitter:
@@ -29,6 +30,13 @@ class EReceiptSubmitter:
         Returns:
             dict: The response from the ETA portal.
         """
+        # Central gate: runs BEFORE the try block so the user gets the clear
+        # readiness error instead of a swallowed {"error": ...} payload.
+        # The ETA POS Connector has no company link; it is derived from the
+        # POS Profile the connector is bound to.
+        company = frappe.db.get_value("POS Profile", self.eta_connector.get("pos_profile"), "company")
+        validate_live_submission_readiness(company, connector=self.eta_connector)
+
         headers = self._get_headers()
         url = self._get_submission_url()
         data = self._prepare_data(ereceipts)
