@@ -473,6 +473,10 @@ def _patch_schema_seams(
     # the real logger would build an Error Log doc through the fake get_doc
     # above, so stub it out and let the exception rethrow cleanly.
     monkeypatch.setattr(frappe, "log_error", lambda *args, **kwargs: None)
+    # The rethrow formats the message through the module-level translation
+    # function; real translation may consult the DB (recording a stray
+    # get_all), so replace it with a deterministic passthrough.
+    monkeypatch.setattr(ereceipt_schema, "_", lambda msg, *args, **kwargs: msg)
 
     def _db_get_value(doctype, name, fieldname, for_update=False, **kwargs):
         events.append(("db_get_value", doctype, name, fieldname, for_update))
