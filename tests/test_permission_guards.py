@@ -78,21 +78,31 @@ def _patch_get_doc(monkeypatch, docs):
 
 
 def _patch_submit_ereceipt_seams(monkeypatch, receipt=None):
-    """Patch the private builder and the submitter; return (build, submit_calls)."""
+    """Patch the private builder, the submitter, and the intent/lock seams;
+    return (build, submit_calls, intent_log)."""
     build = CallRecorder(return_value=receipt)
     monkeypatch.setattr(ereceipt_schema, "_build_erceipt_json", build)
 
     submit_calls = []
+    intent_log = object()
 
     class FakeSubmitter:
         def __init__(self, conn):
             submit_calls.append(("init", conn))
 
-        def submit_ereceipt(self, payload, doctype):
-            submit_calls.append(("submit", payload, doctype))
+        def submit_ereceipt(self, payload, doctype, eta_log):
+            submit_calls.append(("submit", payload, doctype, eta_log))
 
     monkeypatch.setattr(ereceipt_schema, "EReceiptSubmitter", FakeSubmitter)
-    return build, submit_calls
+
+    # Offline seams for the pre-POST submission-intent lifecycle: the FOR
+    # UPDATE row lock, the evidence re-reads, the intent insert, and the
+    # deliberate boundary commit.
+    monkeypatch.setattr(frappe.db, "get_value", lambda *args, **kwargs: None)
+    monkeypatch.setattr(frappe, "get_all", CallRecorder(return_value=[]))
+    monkeypatch.setattr(frappe.db, "commit", lambda: None)
+    monkeypatch.setattr(ereceipt_schema, "create_eta_log", lambda **kwargs: intent_log)
+    return build, submit_calls, intent_log
 
 
 class FakeReceipt:
@@ -283,7 +293,7 @@ def test_fetch_ereceipt_status_permitted_uses_profile_from_doc(monkeypatch):
 def test_submit_ereceipt_denied_submit_permission_before_connector(monkeypatch):
     doc = FakeDoc("POS Invoice", "POS-0001", fields={"pos_profile": "STORE-1"}, deny=True)
     get_doc_calls = _patch_get_doc(monkeypatch, {("POS Invoice", "POS-0001"): doc})
-    build, submit_calls = _patch_submit_ereceipt_seams(monkeypatch)
+    build, submit_calls, _ = _patch_submit_ereceipt_seams(monkeypatch)
 
     with pytest.raises(frappe.PermissionError):
         ereceipt_schema.submit_ereceipt("POS-0001", "STORE-1", "POS Invoice")
@@ -298,7 +308,7 @@ def test_submit_ereceipt_denied_submit_permission_before_connector(monkeypatch):
 def test_submit_ereceipt_rejects_missing_or_mismatched_profile(monkeypatch, supplied_profile):
     doc = FakeDoc("POS Invoice", "POS-0001", fields={"pos_profile": "STORE-1"})
     get_doc_calls = _patch_get_doc(monkeypatch, {("POS Invoice", "POS-0001"): doc})
-    build, submit_calls = _patch_submit_ereceipt_seams(monkeypatch)
+    build, submit_calls, _ = _patch_submit_ereceipt_seams(monkeypatch)
 
     with pytest.raises(frappe.ValidationError):
         ereceipt_schema.submit_ereceipt("POS-0001", supplied_profile, "POS Invoice")
@@ -320,7 +330,7 @@ def test_submit_ereceipt_permitted_and_bound_reaches_submitter(monkeypatch):
         ("ETA POS Connector", "STORE-1"): connector,
     }
     get_doc_calls = _patch_get_doc(monkeypatch, docs)
-    build, submit_calls = _patch_submit_ereceipt_seams(monkeypatch, receipt=FakeReceipt())
+    build, submit_calls, intent_log = _patch_submit_ereceipt_seams(monkeypatch, receipt=FakeReceipt())
 
     ereceipt_schema.submit_ereceipt("POS-0001", "STORE-1", "POS Invoice")
 
@@ -330,7 +340,7 @@ def test_submit_ereceipt_permitted_and_bound_reaches_submitter(monkeypatch):
     assert build.calls == [(("POS-0001", "POS Invoice"), {})]
     assert submit_calls == [
         ("init", connector),
-        ("submit", {"receipts": []}, "POS Invoice"),
+        ("submit", {"receipts": []}, "POS Invoice", intent_log),
     ]
 
 
@@ -345,7 +355,7 @@ def test_submit_ereceipt_submit_authorized_without_read(monkeypatch):
         ("ETA POS Connector", "STORE-1"): connector,
     }
     get_doc_calls = _patch_get_doc(monkeypatch, docs)
-    build, submit_calls = _patch_submit_ereceipt_seams(monkeypatch, receipt=FakeReceipt())
+    build, submit_calls, intent_log = _patch_submit_ereceipt_seams(monkeypatch, receipt=FakeReceipt())
 
     ereceipt_schema.submit_ereceipt("POS-0001", "STORE-1", "POS Invoice")
 
@@ -357,5 +367,5 @@ def test_submit_ereceipt_submit_authorized_without_read(monkeypatch):
     assert build.calls == [(("POS-0001", "POS Invoice"), {})]
     assert submit_calls == [
         ("init", connector),
-        ("submit", {"receipts": []}, "POS Invoice"),
+        ("submit", {"receipts": []}, "POS Invoice", intent_log),
     ]
