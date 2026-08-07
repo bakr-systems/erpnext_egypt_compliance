@@ -16,10 +16,10 @@ from erpnext_egypt_compliance.erpnext_eta.einvoice_schema import (
 
 
 def test_eta_round(db_transaction):
-    assert eta_round(1.2345) == 1.23
-    assert eta_round(1.2355) == 1.24
+    # Default precision is 5 (7b6f2f1), so 4-decimal values pass through unchanged
+    assert eta_round(1.2345) == 1.2345
+    assert eta_round(1.2355) == 1.2355
     assert eta_round(1.2345, 0) == 1.23
-    assert eta_round(1.2355) == 1.24
     assert eta_round(1.2345, 3) == 1.234
     assert eta_round(1.2355, 3) == 1.236
     assert eta_round(1.2345, 4) == 1.2345
@@ -177,25 +177,26 @@ def test_discount_object_construction():
 @pytest.mark.parametrize(
     "invoice_data, expected",
     [
+        # EGP invoice: net amount = net_total * rate, total = base_grand_total
         (
             {
-                "_foreign_company_currency": True,
-                "base_total": 10,
+                "currency": "EGP",
                 "net_total": 30,
                 "base_grand_total": 20,
                 "_exchange_rate": 5,
             },
-            (10 * 5, 30 * 5),
+            (150, 20),
         ),
+        # Foreign currency (d52ba40): base totals are returned as-is
         (
             {
-                "_foreign_company_currency": False,
+                "currency": "USD",
                 "base_total": 10,
                 "net_total": 30,
                 "base_grand_total": 20,
-                "_exchange_rate": 5,
+                "conversion_rate": 5,
             },
-            (30 * 5, 20),
+            (10, 10),
         ),
     ],
 )
