@@ -13,10 +13,12 @@ from erpnext_egypt_compliance.erpnext_eta.utils import (
 from erpnext_egypt_compliance.erpnext_eta.doctype.eta_log.einvoice_logging_utils import submit_einvoice_feedback_logger, submit_einvoice_background_logger
 from erpnext_egypt_compliance.erpnext_eta.utils import get_company_eta_connector
 from erpnext_egypt_compliance.erpnext_eta.einvoice_submitter import EInvoiceSubmitter
+from erpnext_egypt_compliance.erpnext_eta.permission_guards import get_permitted_doc
 from frappe.utils import nowdate
 
 @frappe.whitelist()
 def download_eta_inv_json(docname):
+    get_permitted_doc("Sales Invoice", docname, "read")
     try:
         file_content = get_invoice_asjson(docname)
 
@@ -26,6 +28,7 @@ def download_eta_inv_json(docname):
 
 @frappe.whitelist()
 def get_eta_pdf(docname):
+    get_permitted_doc("Sales Invoice", docname, "read")
     try:
         sinv_doc_company = frappe.get_value("Sales Invoice", docname, "company")
         if not sinv_doc_company:
@@ -44,7 +47,7 @@ def get_eta_pdf(docname):
 
 @frappe.whitelist()
 def fetch_eta_status(docname):
-    
+    get_permitted_doc("Sales Invoice", docname, "write")
     company = frappe.get_value("Sales Invoice", docname, "company")
     connector = get_company_eta_connector(company)
     return update_eta_docstatus(connector, docname)
@@ -116,6 +119,7 @@ def autosubmit_eta_live_submission(docname, connector):
 
 @frappe.whitelist()
 def submit_eta_invoice(docname, submission_reason=None):
+    get_permitted_doc("Sales Invoice", docname, "submit")
     try:
        
         submitted_by = frappe.session.user
@@ -131,6 +135,7 @@ def submit_eta_invoice(docname, submission_reason=None):
 @frappe.whitelist()
 def check_existing_eta_logs(docname):
     """Check if there are existing ETA logs for this invoice"""
+    get_permitted_doc("Sales Invoice", docname, "read")
     try:
         existing_logs = frappe.get_all(
             "ETA Log Documents",
@@ -152,8 +157,8 @@ def check_existing_eta_logs(docname):
 
 @frappe.whitelist()
 def cancel_eta_invoice(docname, reason):
+    doc = get_permitted_doc("Sales Invoice", docname, "cancel")
     try:
-        doc = frappe.get_doc("Sales Invoice", docname)
         connector = get_company_eta_connector(doc.company)
         if not connector:
             frappe.throw(_("ETA Connector not found for company {0}").format(doc.company))
