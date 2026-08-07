@@ -16,6 +16,10 @@ from erpnext_egypt_compliance.erpnext_eta.utils import (
 )
 from frappe import _
 from erpnext_egypt_compliance.erpnext_eta.ereceipt_submitter import EReceiptSubmitter
+from erpnext_egypt_compliance.erpnext_eta.permission_guards import (
+    ERECEIPT_DOCTYPES,
+    get_permitted_doc,
+)
 
 POS_INVOICE_RAW_DATA = {}
 COMPANY_DATA = {}
@@ -340,6 +344,20 @@ class ItemWiseTaxDetails(BaseModel):
 def build_erceipt_json(docname: str, doctype: str):
     """Entry point for creating the POS E-Receipt json."""
 
+    # Enforce the doctype allow-list and read permission on the exact
+    # document before any global raw data or company data are loaded.
+    get_permitted_doc(doctype, docname, "read", allowed_doctypes=ERECEIPT_DOCTYPES)
+    return _build_erceipt_json(docname, doctype)
+
+
+def _build_erceipt_json(docname: str, doctype: str):
+    """Build the POS E-Receipt json.
+
+    Callers must have already enforced the doctype allow-list and the
+    intended document permission; this builder performs no permission
+    checks of its own.
+    """
+
     # Set the global raw data: POS_INVOICE_RAW_DATA, COMPANY_DATA
     set_global_raw_data(docname, doctype)
 
@@ -422,9 +440,22 @@ def download_eta_ereceipt_json(docname, file_content):
 @frappe.whitelist()
 def submit_ereceipt(docname, pos_profile, doctype, raise_throw=True) -> None:
     """Submit the POS E-Receipt to the API."""
+    # Fail closed before schema generation, connector access, log creation,
+    # or HTTP: only the allowed invoice doctypes, the standard submit
+    # permission on the exact document, and a POS profile bound to the one
+    # stored on that document are accepted.
+    doc = get_permitted_doc(doctype, docname, "submit", allowed_doctypes=ERECEIPT_DOCTYPES)
+    stored_pos_profile = doc.get("pos_profile")
+    if not pos_profile or pos_profile != stored_pos_profile:
+        frappe.throw(
+            _("The supplied POS profile does not match the POS profile set on {0} {1}.").format(doctype, docname),
+            title=_("ETA Validation"),
+        )
     try:
-        ereceipt = build_erceipt_json(docname, doctype)
-        connector = frappe.get_doc("ETA POS Connector", pos_profile)
+        # The submit-authorized path calls the private builder directly; it
+        # must not be subjected to an extra read gate inside the broad try.
+        ereceipt = _build_erceipt_json(docname, doctype)
+        connector = frappe.get_doc("ETA POS Connector", stored_pos_profile)
         if connector:
             eta_submitter = EReceiptSubmitter(connector)
             processed_docs = eta_submitter.submit_ereceipt(ereceipt.model_dump(), doctype)
@@ -437,8 +468,17 @@ def submit_ereceipt(docname, pos_profile, doctype, raise_throw=True) -> None:
         
 @frappe.whitelist()      
 def fetch_ereceipt_status(docname, raise_throw=True):
+    # Read-check the exact POS Invoice before profile/connector/API access;
+    # the profile is taken from that permitted document, not from a fresh
+    # unpermissioned lookup.
+    doc = get_permitted_doc("POS Invoice", docname, "read")
+    pos_profile = doc.get("pos_profile")
+    if not pos_profile:
+        frappe.throw(
+            _("POS Invoice {0} has no POS profile set.").format(docname),
+            title=_("ETA Validation"),
+        )
     try:
-        pos_profile = frappe.db.get_value("POS Invoice", docname, "pos_profile")
         connector = frappe.get_doc("ETA POS Connector", pos_profile)
         if connector:
             result = connector.get_receipt_submission(docname)
