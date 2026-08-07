@@ -15,11 +15,21 @@ from erpnext_egypt_compliance.erpnext_eta.einvoice_schema import (
 )
 
 
-def test_eta_round(db_transaction):
+def test_eta_round(monkeypatch, db_transaction):
     # Default precision is 5 (7b6f2f1), so 4-decimal values pass through unchanged
     assert eta_round(1.2345) == 1.2345
     assert eta_round(1.2355) == 1.2355
+    # decimal=0 hits the falsy fallback branch: frappe.get_precision(...) or 2.
+    # The minimal test site has no "Sales Invoice Item" DocType, so stub it to 2.
+    get_precision_calls = []
+
+    def _mocked_get_precision(doctype, fieldname):
+        get_precision_calls.append((doctype, fieldname))
+        return 2
+
+    monkeypatch.setattr(frappe, "get_precision", _mocked_get_precision)
     assert eta_round(1.2345, 0) == 1.23
+    assert get_precision_calls == [("Sales Invoice Item", "net_rate")]
     assert eta_round(1.2345, 3) == 1.234
     assert eta_round(1.2355, 3) == 1.236
     assert eta_round(1.2345, 4) == 1.2345
