@@ -47,19 +47,23 @@ class ETALog(Document):
         self.save()
 
     def process_documents(self, eta_response):
+        # e-Invoice responses key documents by "internalId"; e-Receipt
+        # responses always key them by "receiptNumber", even for Sales
+        # Invoice receipts.
         internal_id_key = "internalId" if self.from_doctype == "Sales Invoice" else "receiptNumber"
+        alternate_id_key = "receiptNumber" if internal_id_key == "internalId" else "internalId"
         child_rows = frappe._dict({row.reference_document: row for row in self.get("documents", default=[])})
 
         for doc in eta_response.get("acceptedDocuments", []):
-            if doc.get(internal_id_key):
-                docname = doc.get(internal_id_key)
+            docname = doc.get(internal_id_key) or doc.get(alternate_id_key)
+            if docname:
                 self.update_eta_fields(doc, docname, eta_response, eta_response.get("submissionId"), "Submitted")
                 fields = {"uuid": doc.get("uuid"), "long_id": doc.get("longId"), "accepted": True}
                 child_rows.get(docname, {}).update(fields)
 
         for doc in eta_response.get("rejectedDocuments", []):
-            if doc.get(internal_id_key):
-                docname = doc.get(internal_id_key)
+            docname = doc.get(internal_id_key) or doc.get(alternate_id_key)
+            if docname:
                 self.update_eta_fields(doc, docname, eta_response, eta_response.get("submissionId"))
                 fields = {
                     "uuid": doc.get("uuid"),

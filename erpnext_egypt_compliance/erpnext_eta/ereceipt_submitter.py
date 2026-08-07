@@ -1,7 +1,6 @@
 import frappe
 from erpnext_egypt_compliance.erpnext_eta.doctype.eta_pos_connector.eta_pos_connector import ETASession
 import json
-from erpnext_egypt_compliance.erpnext_eta.utils import create_eta_log
 import requests
 
 class EReceiptSubmitter:
@@ -18,25 +17,50 @@ class EReceiptSubmitter:
         """
         self.eta_connector = eta_connector
 
-    def submit_ereceipt(self, ereceipts, doctype):
+    def submit_ereceipt(self, ereceipts, doctype, eta_log):
         """
         Submit e-receipts to the ETA portal.
 
         Args:
             ereceipts (dict): A dictionary of e-receipts to be submitted.
             doctype (str): The document type of the receipts.
+            eta_log (Document): The pre-created ETA Log submission intent
+                (status "Started", already committed by the caller before
+                this external POST). It is updated in place from the ETA
+                response; it is never created here.
 
         Returns:
             dict: The response from the ETA portal.
-        """
-        headers = self._get_headers()
-        url = self._get_submission_url()
-        data = self._prepare_data(ereceipts)
 
+        Failure semantics: an ambiguous failure (network timeout/exception,
+        or a local error after ETA may have accepted) leaves the intent at
+        "Started" and therefore blocked for retry pending operator
+        reconciliation; it is NOT marked retryable here. Only a definitive
+        ETA response updates the intent (Completed/Partially Succeeded/Failed).
+        """
+        try:
+            headers = self._get_headers()
+            url = self._get_submission_url()
+            data = self._prepare_data(ereceipts)
+        except Exception as e:
+            # Pre-POST failure (headers/url/payload preparation): the ETA
+            # portal was definitely never reached, so the intent is
+            # conclusively Failed and retryable — record and commit that.
+            self._handle_exception(e)
+            eta_log.eta_response = str(e)
+            eta_log.submission_status = "Failed"
+            eta_log.save()
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit
+            return {"error": str(e)}
+
+        # Irreversible boundary: from here on the POST may have reached ETA.
+        # Any exception from _send_submit_request or afterwards is ambiguous
+        # and must leave the already-committed intent "Started" (no save,
+        # no commit) pending operator reconciliation.
         try:
             eta_response = self._send_submit_request(url, headers, data)
-            processed_response = self._process_response(eta_response, ereceipts, doctype)
-            frappe.db.commit()
+            processed_response = self._process_response(eta_response, ereceipts, doctype, eta_log)
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit
             return processed_response
         except Exception as e:
             self._handle_exception(e)
@@ -126,7 +150,7 @@ class EReceiptSubmitter:
         _eta_response["status_code"] = response.status_code or None
         return _eta_response
 
-    def _process_response(self, eta_response, ereceipts, doctype):
+    def _process_response(self, eta_response, ereceipts, doctype, eta_log):
         """
         Process the response from the ETA portal.
 
@@ -134,26 +158,16 @@ class EReceiptSubmitter:
             eta_response (dict): The response from the ETA portal.
             ereceipts (dict): The submitted e-receipts.
             doctype (str): The document type of the receipts.
+            eta_log (Document): The pre-created submission intent ETA Log.
 
         Returns:
             dict: The processed response.
         """
-        documents = [
-            {"reference_doctype": doctype, "reference_document": d.get("header")["receiptNumber"]}
-            for d in ereceipts.get("receipts", [])
-        ]
-        initial_eta_log = create_eta_log(
-            from_doctype=doctype,
-			pos_profile=self.eta_connector.pos_profile,
-            documents=documents,
-            submission_summary=f"Total no of receipts: {len(ereceipts.get('receipts'))}"
-        )
-
         if eta_response.get("acceptedDocuments") or eta_response.get("rejectedDocuments"):
-            self._handle_success_response(eta_response, ereceipts, initial_eta_log, doctype)
+            self._handle_success_response(eta_response, ereceipts, eta_log, doctype)
 
         if eta_response.get("error"):
-            self._handle_error_response(eta_response, initial_eta_log)
+            self._handle_error_response(eta_response, eta_log)
 
         return eta_response
 
@@ -179,8 +193,11 @@ class EReceiptSubmitter:
         eta_log.submission_id = eta_response.get("submissionId")
         eta_log.submission_summary = summary_message
         eta_log.submission_status = submission_status
+        # Process documents before saving so child-row updates (uuid,
+        # long_id, accepted, error) are persisted by the same save.
+        # ETALog.process_documents takes only the ETA response.
+        eta_log.process_documents(eta_response)
         eta_log.save()
-        eta_log.process_documents(eta_response, doctype, eta_log)
 
     def _handle_error_response(self, eta_response, initial_eta_log):
         """

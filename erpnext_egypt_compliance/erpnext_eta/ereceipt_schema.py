@@ -11,6 +11,7 @@ import pytz
 from pydantic import BaseModel, Field, conint, validator
 
 from erpnext_egypt_compliance.erpnext_eta.utils import (
+    create_eta_log,
     eta_datetime_issued_format,
     get_company_eta_connector,
 )
@@ -437,6 +438,127 @@ def download_eta_ereceipt_json(docname, file_content):
     frappe.local.response.type = "download"
 
 
+def _raise_if_already_accepted(doctype, docname):
+    """Fail closed against duplicate ETA submissions.
+
+    The ETA portal has no idempotency key for receipt submissions, so
+    resubmitting an already accepted document creates a duplicate.
+    Reliable existing evidence of acceptance is the fixture-defined
+    ``eta_uuid`` on a Sales Invoice, or an accepted ETA Log Documents
+    row for either allowed doctype. Rejected or failed attempts leave no
+    such evidence and stay resubmittable.
+
+    Must be called under the invoice row lock (see
+    ``_create_submission_intent``); reads fresh DB state, not a document
+    snapshot.
+    """
+    accepted_uuid = None
+    if doctype == "Sales Invoice":
+        accepted_uuid = frappe.db.get_value("Sales Invoice", docname, "eta_uuid")
+    accepted_row = None
+    if not accepted_uuid:
+        accepted_rows = frappe.get_all(
+            "ETA Log Documents",
+            filters={
+                "reference_doctype": doctype,
+                "reference_document": docname,
+                "accepted": 1,
+            },
+            fields=["uuid"],
+            limit=1,
+        )
+        accepted_row = accepted_rows[0] if accepted_rows else None
+    if accepted_uuid or accepted_row:
+        uuid_note = accepted_uuid or accepted_row.get("uuid") or _("recorded in ETA Log")
+        frappe.throw(
+            _(
+                "{0} {1} was already accepted by the ETA portal (UUID: {2})."
+                " Resubmitting would create a duplicate submission; fetch its status instead."
+            ).format(doctype, docname, uuid_note),
+            title=_("Duplicate e-Receipt Submission"),
+        )
+
+
+def _raise_if_started_intent_exists(doctype, docname):
+    """Block while a previous submission attempt is unresolved.
+
+    A "Started" ETA Log intent means a POST to ETA was attempted (or is
+    in flight) but its outcome is unknown: the network timed out, the
+    request failed after ETA may have accepted, or local processing
+    failed after acceptance. Retrying could duplicate an accepted
+    receipt, so the attempt stays blocked until an operator reconciles
+    it (fetch the receipt/submission status from ETA, then mark the ETA
+    Log). Only a definitive ETA answer (acceptance, rejection, or error
+    response) moves the intent out of "Started".
+
+    Must be called under the invoice row lock (see
+    ``_create_submission_intent``).
+    """
+    child_rows = frappe.get_all(
+        "ETA Log Documents",
+        filters={"reference_doctype": doctype, "reference_document": docname},
+        fields=["parent"],
+    )
+    if not child_rows:
+        return
+    started = frappe.get_all(
+        "ETA Log",
+        filters={
+            "name": ["in", [row.parent for row in child_rows]],
+            "submission_status": "Started",
+        },
+        fields=["name"],
+        limit=1,
+    )
+    if started:
+        frappe.throw(
+            _(
+                "{0} {1} has an unresolved e-Receipt submission (ETA Log {2})."
+                " Its ETA outcome is unknown; reconcile it (fetch the status from ETA)"
+                " instead of resubmitting, or a duplicate submission may be created."
+            ).format(doctype, docname, started[0].name),
+            title=_("Unresolved e-Receipt Submission"),
+        )
+
+
+def _create_submission_intent(doctype, docname, pos_profile, receipt_count):
+    """Create the durable per-document submission intent before the ETA POST.
+
+    The invoice row is locked FOR UPDATE (doctype is strictly allowlisted
+    via ERECEIPT_DOCTYPES in get_permitted_doc before this point), then
+    acceptance and unresolved-intent evidence is re-read under the lock,
+    so a concurrent request that waited on the lock observes the intent
+    committed here and is blocked instead of submitting a duplicate.
+
+    The ETA Log (submission_status "Started") is committed deliberately
+    at this external-side-effect boundary: it must be durable before the
+    POST so that an ambiguous outcome (timeout, failure after ETA
+    acceptance) remains blocked pending operator reconciliation rather
+    than silently becoming retryable.
+
+    This is not a global exactly-once guarantee: it serializes intent
+    creation per invoice and fails closed on unknown outcomes; the
+    residual "Started" state is the documented operator-reconciliation
+    path.
+    """
+    # Lock this exact invoice row; blocks a concurrent submitter until the
+    # intent below is committed and visible.
+    frappe.db.get_value(doctype, docname, "name", for_update=True)
+    _raise_if_already_accepted(doctype, docname)
+    _raise_if_started_intent_exists(doctype, docname)
+    eta_log = create_eta_log(
+        from_doctype=doctype,
+        pos_profile=pos_profile,
+        documents=[{"reference_doctype": doctype, "reference_document": docname}],
+        submission_summary=f"Total no of receipts: {receipt_count}",
+        submission_status="Started",
+        submitted_by=frappe.session.user,
+    )
+    # Deliberate boundary commit: the intent must outlive this request.
+    frappe.db.commit()  # nosemgrep: frappe-manual-commit
+    return eta_log
+
+
 @frappe.whitelist()
 def submit_ereceipt(docname, pos_profile, doctype, raise_throw=True) -> None:
     """Submit the POS E-Receipt to the API."""
@@ -457,8 +579,12 @@ def submit_ereceipt(docname, pos_profile, doctype, raise_throw=True) -> None:
         ereceipt = _build_erceipt_json(docname, doctype)
         connector = frappe.get_doc("ETA POS Connector", stored_pos_profile)
         if connector:
+            payload = ereceipt.model_dump()
+            eta_log = _create_submission_intent(
+                doctype, docname, stored_pos_profile, len(payload.get("receipts", []))
+            )
             eta_submitter = EReceiptSubmitter(connector)
-            processed_docs = eta_submitter.submit_ereceipt(ereceipt.model_dump(), doctype)
+            processed_docs = eta_submitter.submit_ereceipt(payload, doctype, eta_log)
     except Exception as e:
         frappe.log_error(title="Submit E-Receipt", message=e, reference_doctype="POS Invoice", reference_name=docname)
         if raise_throw:
