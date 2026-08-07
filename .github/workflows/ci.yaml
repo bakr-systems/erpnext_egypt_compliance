@@ -106,4 +106,4 @@ jobs:
         run: |
           bench --site test_site set-config allow_tests true
           env/bin/python -m pip install pytest-frappe==0.2.5
-          env/bin/python -m pytest -o addopts= --sites-path=/home/runner/frappe-bench/sites apps/erpnext_egypt_compliance/tests
+          env/bin/python -m pytest -o addopts= --sites-path=/home/runner/frappe-bench/sites --test-site=test_site apps/erpnext_egypt_compliance/tests
