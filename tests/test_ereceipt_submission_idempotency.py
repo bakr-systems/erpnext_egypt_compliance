@@ -469,6 +469,10 @@ def _patch_schema_seams(
         return docs[(doctype, name)]
 
     monkeypatch.setattr(frappe, "get_doc", _get_doc)
+    # submit_ereceipt logs expected ValidationErrors via frappe.log_error;
+    # the real logger would build an Error Log doc through the fake get_doc
+    # above, so stub it out and let the exception rethrow cleanly.
+    monkeypatch.setattr(frappe, "log_error", lambda *args, **kwargs: None)
 
     def _db_get_value(doctype, name, fieldname, for_update=False, **kwargs):
         events.append(("db_get_value", doctype, name, fieldname, for_update))
