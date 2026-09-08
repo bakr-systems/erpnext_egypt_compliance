@@ -6,10 +6,16 @@ All tests are offline: ``frappe.get_doc`` and every downstream seam
 monkeypatched, so no network, ETA, or database access happens.
 """
 
+import json
+from html import escape
+from types import SimpleNamespace
+
 import frappe
 import pytest
+import requests
 
 import erpnext_egypt_compliance.erpnext_eta.ereceipt_schema as ereceipt_schema
+import erpnext_egypt_compliance.erpnext_eta.ereceipt_submitter as ereceipt_submitter
 import erpnext_egypt_compliance.erpnext_eta.main as eta_main
 from erpnext_egypt_compliance.erpnext_eta.permission_guards import ERECEIPT_DOCTYPES
 
@@ -262,27 +268,203 @@ def test_fetch_ereceipt_status_rejects_missing_profile(monkeypatch, raise_throw,
     assert get_doc_calls == [("POS Invoice", "POS-0001")]
 
 
-def test_fetch_ereceipt_status_permitted_uses_profile_from_doc(monkeypatch):
-    doc = FakeDoc("POS Invoice", "POS-0001", fields={"pos_profile": "STORE-1"})
-    receipt_calls = []
+def _patch_receipt_status_http(monkeypatch, doc, *, body=None, http_status=200, error=None):
+    """Exercise the real submitter and requests response parsing without a network."""
+    token = CallRecorder(return_value="offline-token")
+    connector = SimpleNamespace(ETA_BASE="https://eta.example.invalid/api/v1", get_access_token=token)
+    get_doc_calls = _patch_get_doc(
+        monkeypatch,
+        {
+            ("POS Invoice", "POS-0001"): doc,
+            ("ETA POS Connector", "STORE-1"): connector,
+        },
+    )
+    http_calls = []
 
-    class FakeConnector:
-        def get_receipt_submission(self, docname):
-            receipt_calls.append(docname)
-            return "ok"
+    def get(url, **kwargs):
+        http_calls.append((url, kwargs))
+        if error is not None:
+            raise error
+        response = requests.Response()
+        response.status_code = http_status
+        response.url = url
+        response._content = json.dumps(body).encode()
+        return response
 
-    docs = {
-        ("POS Invoice", "POS-0001"): doc,
-        ("ETA POS Connector", "STORE-1"): FakeConnector(),
-    }
-    get_doc_calls = _patch_get_doc(monkeypatch, docs)
-    monkeypatch.setattr(frappe, "msgprint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        ereceipt_submitter,
+        "ETASession",
+        lambda: SimpleNamespace(get_session=lambda: SimpleNamespace(get=get)),
+    )
+    messages = CallRecorder()
 
-    ereceipt_schema.fetch_ereceipt_status("POS-0001")
+    def msgprint(message, *args, raise_exception=False, **kwargs):
+        # Frappe 15 throw delegates exception raising to msgprint. Preserve
+        # that contract instead of turning denied/error paths into success.
+        if raise_exception:
+            if isinstance(raise_exception, type) and issubclass(raise_exception, Exception):
+                raise raise_exception(message)
+            if isinstance(raise_exception, Exception):
+                raise_exception.args = (message,)
+                raise raise_exception
+            raise frappe.ValidationError(message)
+        messages(message, *args, **kwargs)
+
+    monkeypatch.setattr(frappe, "msgprint", msgprint)
+    monkeypatch.setattr(frappe, "log_error", CallRecorder())
+    return get_doc_calls, http_calls, messages, token
+
+
+@pytest.mark.parametrize("exception_kind", ["class", "instance", "default"])
+def test_receipt_status_display_mock_preserves_requested_exception(monkeypatch, exception_kind):
+    doc = FakeDoc("POS Invoice", "POS-0001")
+    _, http_calls, messages, token = _patch_receipt_status_http(monkeypatch, doc)
+    requested = {
+        "class": frappe.PermissionError,
+        "instance": frappe.PermissionError("old message"),
+        "default": True,
+    }[exception_kind]
+    expected = frappe.ValidationError if exception_kind == "default" else frappe.PermissionError
+
+    # Test the display seam directly, so even a standalone throw stub cannot
+    # hide a msgprint mock that silently swallows raise_exception.
+    with pytest.raises(expected, match="offline denied"):
+        frappe.msgprint("offline denied", raise_exception=requested)
+    if exception_kind != "default":
+        with pytest.raises(expected, match="offline throw"):
+            frappe.throw("offline throw", exc=requested)
+    else:
+        with pytest.raises(frappe.ValidationError, match="offline throw"):
+            frappe.throw("offline throw")
+
+    assert messages.calls == []
+    assert http_calls == []
+    assert token.calls == []
+
+
+@pytest.mark.parametrize("raise_throw", [True, False])
+def test_fetch_ereceipt_status_permitted_uses_profile_and_uuid_from_doc(monkeypatch, raise_throw):
+    doc = FakeDoc(
+        "POS Invoice",
+        "POS-0001",
+        fields={
+            "pos_profile": "STORE-1",
+            "custom_eta_uuid": "a" * 64,
+            "custom_eta_submission_id": "BATCH-WITH-OTHER-RECEIPTS",
+        },
+    )
+    result = {"receipt": {"uuid": "a" * 64, "status": "Valid"}}
+    get_doc_calls, http_calls, messages, token = _patch_receipt_status_http(monkeypatch, doc, body=result)
+
+    assert ereceipt_schema.fetch_ereceipt_status("POS-0001", raise_throw=raise_throw) == result
 
     assert doc.permission_checks == ["read"]
     assert get_doc_calls == [("POS Invoice", "POS-0001"), ("ETA POS Connector", "STORE-1")]
-    assert receipt_calls == ["POS-0001"]
+    assert http_calls == [
+        (
+            "https://eta.example.invalid/api/v1/receipts/" + "a" * 64 + "/raw/",
+            {
+                "headers": {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": "Bearer offline-token",
+                }
+            },
+        ),
+    ]
+    assert token.calls
+    expected_messages = [(("ETA receipt status: Valid",), {})] if raise_throw else []
+    assert messages.calls == expected_messages
+    assert doc.saves == 0
+
+
+def test_fetch_ereceipt_status_escapes_only_status_for_display(monkeypatch):
+    doc = FakeDoc(
+        "POS Invoice",
+        "POS-0001",
+        fields={"pos_profile": "STORE-1", "custom_eta_uuid": "a" * 64},
+    )
+    malicious = '<img src=x onerror="alert(1)">'
+    result = {
+        "receipt": {"uuid": "a" * 64, "status": malicious},
+        "rawDocument": '<script>alert("raw receipt")</script>',
+    }
+    _, http_calls, messages, _ = _patch_receipt_status_http(monkeypatch, doc, body=result)
+
+    assert ereceipt_schema.fetch_ereceipt_status("POS-0001") == result
+
+    assert messages.calls == [(("ETA receipt status: " + escape(malicious),), {})]
+    displayed = messages.calls[0][0][0]
+    assert "<img" not in displayed
+    assert "<script" not in displayed
+    assert "raw receipt" not in displayed
+    assert len(http_calls) == 1
+    assert doc.saves == 0
+
+
+@pytest.mark.parametrize("raise_throw", [True, False])
+@pytest.mark.parametrize("stored_uuid", [None, "", "   "])
+def test_fetch_ereceipt_status_rejects_missing_uuid_before_connector(monkeypatch, raise_throw, stored_uuid):
+    doc = FakeDoc(
+        "POS Invoice",
+        "POS-0001",
+        fields={
+            "pos_profile": "STORE-1",
+            "custom_eta_uuid": stored_uuid,
+            "custom_eta_submission_id": "MUST-NOT-FALL-BACK-TO-BATCH",
+        },
+    )
+    calls = _patch_get_doc(monkeypatch, {("POS Invoice", "POS-0001"): doc})
+    submitter = CallRecorder()
+    monkeypatch.setattr(ereceipt_schema, "EReceiptSubmitter", submitter)
+    monkeypatch.setattr(frappe, "log_error", CallRecorder())
+
+    with pytest.raises(frappe.ValidationError, match="UUID"):
+        ereceipt_schema.fetch_ereceipt_status("POS-0001", raise_throw=raise_throw)
+
+    assert doc.permission_checks == ["read"]
+    assert calls == [("POS Invoice", "POS-0001")]
+    assert submitter.calls == []
+
+
+@pytest.mark.parametrize("raise_throw", [True, False])
+@pytest.mark.parametrize(
+    "failure", ["http", "timeout", "batch", "wrong_uuid", "missing_status", "nonstring_status", "blank_status"]
+)
+def test_fetch_ereceipt_status_does_not_report_failed_or_unbound_response_as_success(monkeypatch, raise_throw, failure):
+    doc = FakeDoc(
+        "POS Invoice",
+        "POS-0001",
+        fields={"pos_profile": "STORE-1", "custom_eta_uuid": "a" * 64},
+    )
+    body = {"receipt": {"uuid": "a" * 64, "status": "Valid"}}
+    if failure == "batch":
+        body = {"receipts": [{"uuid": "b" * 64, "status": "Valid"}]}
+    elif failure == "wrong_uuid":
+        body["receipt"]["uuid"] = "b" * 64
+    elif failure == "missing_status":
+        del body["receipt"]["status"]
+    elif failure == "nonstring_status":
+        body["receipt"]["status"] = ["Valid"]
+    elif failure == "blank_status":
+        body["receipt"]["status"] = "   "
+    _, http_calls, messages, _ = _patch_receipt_status_http(
+        monkeypatch,
+        doc,
+        body=body,
+        http_status=503 if failure == "http" else 200,
+        error=requests.Timeout("offline timeout") if failure == "timeout" else None,
+    )
+
+    if raise_throw:
+        with pytest.raises(frappe.ValidationError):
+            ereceipt_schema.fetch_ereceipt_status("POS-0001")
+    else:
+        assert ereceipt_schema.fetch_ereceipt_status("POS-0001", raise_throw=False) is None
+
+    assert len(http_calls) == 1
+    assert messages.calls == []
+    assert doc.permission_checks == ["read"]
+    assert doc.saves == 0
 
 
 # ---------------------------------------------------------------------------

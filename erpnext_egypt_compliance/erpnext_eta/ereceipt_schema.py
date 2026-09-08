@@ -2,6 +2,7 @@ import collections
 import hashlib
 import json
 from datetime import datetime
+from html import escape
 from typing import Dict, List, Optional
 from uuid import uuid4
 
@@ -604,18 +605,38 @@ def fetch_ereceipt_status(docname, raise_throw=True):
             _("POS Invoice {0} has no POS profile set.").format(docname),
             title=_("ETA Validation"),
         )
+    receipt_uuid = doc.get("custom_eta_uuid")
+    if not isinstance(receipt_uuid, str) or not receipt_uuid.strip():
+        frappe.throw(
+            _("POS Invoice {0} has no ETA receipt UUID set.").format(docname),
+            title=_("ETA Validation"),
+        )
     try:
         connector = frappe.get_doc("ETA POS Connector", pos_profile)
-        if connector:
-            result = connector.get_receipt_submission(docname)
-            if raise_throw:
-                frappe.msgprint(_(str(result)))
+        # A submission can contain other invoices. Fetch only this permitted
+        # invoice's stored UUID through the existing single-receipt API.
+        result = EReceiptSubmitter(connector).get_receipt_status(receipt_uuid)
+        receipt = result.get("receipt") if isinstance(result, dict) else None
+        status = receipt.get("status") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("uuid") != receipt_uuid
+            or not isinstance(status, str)
+            or not status.strip()
+        ):
+            # The submitter returns a string on HTTP failure. Never display
+            # that, a batch response, or another receipt as a successful fetch.
+            frappe.throw(_("ETA did not return the requested receipt status."))
+        if raise_throw:
+            frappe.msgprint(_("ETA receipt status: {0}").format(escape(status)))
+        return result
     except Exception as e:
         frappe.log_error(title="Fetch e-Receipt Status", message=e, reference_doctype="POS Invoice", reference_name=docname)
         if raise_throw:
             frappe.throw(
-                    _(e),
-                    title=_("Fetch e-Receipt Failed"),)
+                _(str(e)),
+                title=_("Fetch e-Receipt Failed"),
+            )
 
 
 def _pos_total_qty():

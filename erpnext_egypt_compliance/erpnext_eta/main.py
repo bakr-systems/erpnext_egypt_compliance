@@ -66,6 +66,7 @@ def get_batch_invoices(company):
         docs = frappe.get_all(
             "Sales Invoice",
             filters=[
+                ["company", "=", company],
                 ["eta_signature", "!=", ""],
                 ["docstatus", "=", 1],
                 ["eta_status", "=", ""],
